@@ -1,0 +1,252 @@
+#!/bin/bash
+#------------------------------------------------------------------------------#
+# Script to launch a compile job onto Atos HPCF
+#------------------------------------------------------------------------------#
+
+# Default values
+PLATFORM=hpc
+TIME="12:00:00"
+JOB_OUTPUT=/dev/null
+
+ECSBATCH=/usr/local/bin/ecsbatch
+ECSQUEUE=/usr/local/bin/ecsqueue
+ECSCANCEL=/usr/local/bin/ecscancel
+QOS="np"
+
+# Define complete SSH command
+SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR -oSendEnv=STHOST -q"
+SSH="$SSH -o ControlPath=\"${TMPDIR:-/tmp}/ssh_%r@%h-%p\" -o ControlMaster=auto -o ControlPersist=60"
+
+
+# Make sure we can use an existing Temporary directly
+if [[ -n $TMPDIR ]] && [[ ! -d $TMPDIR ]]; then
+    TMPDIR=/tmp
+fi
+
+#===  FUNCTION  ================================================================
+#         NAME:  usage
+#  DESCRIPTION:  Display usage information.
+#===============================================================================
+function usage ()
+{
+    echo "Usage :  $0 [options] [--] [CMD]
+
+    -h|help        Display this message
+    -k|kill        Cancel any running interactive job
+    -Q|quiet       Silent mode"
+}    # ----------  end of function usage  ----------
+
+#===  FUNCTION  ================================================================
+#         NAME:  query_job
+#  DESCRIPTION:  Checks if there is any interactive job running
+#===============================================================================
+function query_job()
+{
+    squeue=$($SSH -x $HOST "$ECSQUEUE -u \$USER -n $NAME -q $QOS -O cluster:8,jobid:12,state:12,batchhost:10,timelimit:.11,timeleft:.11,maxcpus:.6,minmemory:.8,tres-per-node:.16$SQUEUE_GPU_TRES")
+    if [[ $? -ne 0 ]]; then
+        echo -e "ERROR: could not get job state for user $USER" >&2
+        exit 1
+    fi
+
+    jobline=($(echo -e "$squeue" | sed "1 d"))
+    if [ "$jobline" != "" ]; then
+        cluster=${jobline[0]}
+        jobid=${jobline[1]}
+        state=${jobline[2]}
+        node=${jobline[3]}
+        timelimit=${jobline[4]}
+        timeleft=${jobline[5]}
+        numcpus=${jobline[6]}
+        memory=${jobline[7]}
+        memory=${memory//[ gbGBmM]/}
+        tmpsize=${jobline[8]}
+        gpus=${jobline[9]}
+        [[ -n "$node" ]] && \
+        [[ -f ~/.ssh/config ]] && \
+        grep -q -e "^[[:blank:]]*Include[[:blank:]]\+devnode_ssh_config" ~/.ssh/*config && \
+        cat > ~/.ssh/devnode_ssh_config <<EOF
+# Dynamic definition for ECMWF compilation session $jobid
+Host devnode
+    Hostname $node
+EOF
+    else
+        cluster=""
+        jobid=""
+        state=""
+        node=""
+        timelimit=""
+        timeleft=""
+        numcpus=""
+        memory=""
+        tmpsize=""
+    fi
+}
+
+function print_queue_status() {
+    echo -e "$squeue" | sed -e "s|gres/ssdtmp:|              |g" -e "s:N/A:  N/A:"  -e "s|gres/gpu:| |g" -e "s/TIME_LEFTMAX_CPMIN_MEMO/TIME_LEFT  CPUS  MEMORY/" -e "s/TRES_PER_NODE/LOCALSSD+TMPDIR/"  -e "s/TRES_PER_JOB/GPUS/"
+}
+
+
+#===  FUNCTION  ================================================================
+#         NAME:  check_running_job
+#  DESCRIPTION:  checks if the job is running and ready
+#===============================================================================
+function check_running_job ()
+{
+    nchecks=${1:-0}
+    icheck=0
+    sourcesFolderReady="preparing"
+    while [[ "$state" != "R"* || $sourcesFolderReady = "preparing" ]]; do
+
+        naptime=$(($icheck*5*$icheck))
+        if [[ $naptime -gt 0 && $QUIET -eq 0 ]]; then
+            echo -e "Waiting $naptime seconds for the job to be ready..."
+        fi
+        sleep $naptime
+        query_job
+
+        # Check if source folder is ready
+        sourcesFolderReady=$($SSH -x $HOST test -e ./.compileNodeReady && echo "ready" || echo "preparing")
+        icheck=$(($icheck+1))
+        if [[ $icheck -ge nchecks ]]; then
+            break
+        fi
+
+    done
+    while [[ "$state" == "C"* ]]; do
+        naptime=10
+        [[ $QUIET -eq 0 ]] && echo -e "Waiting for the previous job to complete..."
+        sleep $naptime
+        query_job
+    done
+    if [ "$node" == "n/a" ]; then
+        echo "ERROR: Your interactive job $jobid is still in the queue. Try again in a few minutes, or cancel it with $0 $PLATARG-k" >&2
+        exit 1
+    fi
+    if [ "$node" != "" ]; then
+
+        [[ $QUIET -eq 0 ]] && echo -e ""
+        [[ $QUIET -eq 0 ]] && echo -e "WARNING: A compile job $jobid is already running on $PLATFORM. \nTo cancel the job:\n\t$0 $PLATARG-k"
+        [[ $QUIET -eq 0 ]] && echo -e ""
+
+        [[ $QUIET -eq 0 ]] && echo -e "Queue status"
+        [[ $QUIET -eq 0 ]] && print_queue_status
+        exit 0
+
+    fi
+
+}
+
+
+
+#===  FUNCTION  ================================================================
+#         NAME:  submit_job
+#  DESCRIPTION:  Submits a job into HOST using stdin
+#===============================================================================
+function submit_job
+{
+
+    $SSH -x $HOST $ECSBATCH <<EOFHERE
+#!/bin/bash
+#SBATCH --job-name=$NAME
+#SBATCH --time=$TIME
+#SBATCH --qos=$QOS
+
+
+#===  FUNCTION  ================================================================
+#         NAME:  sig_handler_USRTEARDOWN
+#  DESCRIPTION:  Function to apply on job tear down
+#===============================================================================
+function sig_handler_TEARDOWN ()
+{
+        echo "   function sig_handler_TEARDOWN called"
+        tar -cvf IAL-bundle-WIP.tar IAL-bundle
+        mv \$TMPDIR/IAL-bundle-WIP.tar \$PERM
+        cd ~
+        rm -f ial-source-lnk
+        rm -f .compileNodeReady
+        exit 2
+}
+
+set -x
+
+## Handle function association ##
+# associate the function "sig_handler_TEARDOWN" with the SIGUSR1 signal
+trap sig_handler_TEARDOWN SIGUSR1
+
+rm -f ial-source-lnk
+rm -f .compileNodeReady
+cp \$PERM/IAL-bundle-WIP.tar \$TMPDIR
+cd \$TMPDIR
+tar -xvf IAL-bundle-WIP.tar
+ln -s -f \$TMPDIR/IAL-bundle/source/ial-source ~/ial-source-lnk
+touch ~/.compileNodeReady
+
+set +x
+while :; do
+    sleep 1
+done
+
+# Let's wait for signals or end of all background commands
+wait
+
+exit 0
+
+EOFHERE
+
+if [[ $? -ne 0 ]]; then
+    exit 1
+fi
+
+}
+
+#===  FUNCTION  ================================================================
+#         NAME:  cancel_jobs
+#  DESCRIPTION:  Cancels the interactive jobs
+#===============================================================================
+function cancel_jobs()
+{
+    query_job
+    if [[ -n "$jobid" ]]; then
+        [[ $QUIET -eq 0 ]] && echo "cancelling job $jobid..."
+        [[ $QUIET -eq 0 ]] && print_queue_status
+        $SSH -x -t $HOST "$ECSCANCEL -i --batch --signal=SIGUSR1 $jobid"
+    else
+        [[ $QUIET -eq 0 ]] && echo "No ${JOBTYPE} jobs found to cancel on $PLATFORM"
+    fi
+    exit 0
+}
+
+
+
+
+while getopts ":hkQ" opt
+do
+    case $opt in
+
+        h|help)  usage; exit 0   ;;
+        k|kill) KILL=1 ;;
+        Q|quiet) QUIET=1 ;;
+        *)  echo -e "Option does not exist : $OPTARG\n" >&2
+            usage; exit 1   ;;
+
+    esac    # --- end of case ---
+done
+
+QUIET=0
+HOST=$PLATFORM-login
+ECUSER=$($SSH -x $HOST whoami)
+USER=$ECUSER
+NAME=$USER-WIP
+
+
+if [[ -n "$KILL" ]]; then
+    cancel_jobs
+fi
+
+check_running_job
+echo "submitting job"
+submit_job
+check_running_job 5
+exit 0
+
