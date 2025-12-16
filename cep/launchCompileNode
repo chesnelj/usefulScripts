@@ -151,7 +151,7 @@ function submit_job
 #SBATCH --job-name=$NAME
 #SBATCH --time=$TIME
 #SBATCH --qos=$QOS
-
+#SBATCH --signal=B:SIGUSR1@300
 
 #===  FUNCTION  ================================================================
 #         NAME:  sig_handler_USRTEARDOWN
