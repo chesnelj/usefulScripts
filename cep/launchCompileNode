@@ -61,6 +61,7 @@ function query_job()
         memory=${memory//[ gbGBmM]/}
         tmpsize=${jobline[8]}
         gpus=${jobline[9]}
+        echo -e "job found on node " $node
         [[ -n "$node" ]] && \
         [[ -f ~/.ssh/config ]] && \
         grep -q -e "^[[:blank:]]*Include[[:blank:]]\+devnode_ssh_config" ~/.ssh/*config && \
@@ -179,7 +180,7 @@ rm -f .compileNodeReady
 cp \$PERM/IAL-bundle-WIP.tar \$TMPDIR
 cd \$TMPDIR
 tar -xvf IAL-bundle-WIP.tar
-ln -s -f \$TMPDIR/IAL-bundle/source/ial-source ~/ial-source-lnk
+ln -s -f \$TMPDIR/IAL-bundle ~/ial-source-lnk
 touch ~/.compileNodeReady
 
 set +x
